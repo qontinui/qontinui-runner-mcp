@@ -1,195 +1,174 @@
-# Qontinui Desktop Runner & MCP Server
+# Qontinui Runner MCP Server
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-
-Tauri-based desktop runner and Model Context Protocol (MCP) server for Qontinui automation.
+MCP (Model Context Protocol) server for Qontinui visual automation with integrated execution.
 
 ## Overview
 
-The Qontinui Runner provides:
-- Desktop application for running automation scripts
-- MCP server for AI agent integration
-- Real-time execution monitoring
-- Cross-platform support (Windows, macOS, Linux)
+This MCP server enables AI agents (like Claude) to:
+- **Discover** automation actions and workflow templates via full-text search
+- **Generate** workflows from natural language descriptions
+- **Validate** workflow structures with cycle detection
+- **Execute** GUI automations using the Qontinui Python executor
+- **Track** execution history and retrieve results
 
 ## Architecture
 
 ```
-qontinui-runner-mcp/
-├── src/              # Svelte frontend
-│   ├── lib/         # Components and utilities
-│   ├── routes/      # SvelteKit routes
-│   └── app.html     # Main HTML template
-├── src-tauri/       # Rust backend
-│   ├── src/         # Rust source code
-│   ├── Cargo.toml   # Rust dependencies
-│   └── tauri.conf.json
-└── mcp-server/      # MCP server implementation
-    ├── server.py    # FastMCP server
-    └── tools.py     # MCP tools
+┌──────────────────────────────────────────────────────────────┐
+│                       Claude Code                             │
+│                            ↓                                  │
+│  ┌────────────────────────────────────────────────────────┐  │
+│  │           qontinui-runner-mcp (Python MCP Server)       │  │
+│  │                                                         │  │
+│  │  MCP Tools:                                             │  │
+│  │  • search_nodes, search_workflows (knowledge)           │  │
+│  │  • generate_workflow, validate_workflow                 │  │
+│  │  • run_automation, get_execution (execution)            │  │
+│  │                                                         │  │
+│  │  Executor Bridge:                                       │  │
+│  │  • Spawns Python executor process                       │  │
+│  │  • JSON communication via stdin/stdout                  │  │
+│  │  • Event collection and result tracking                 │  │
+│  │                                                         │  │
+│  │  Database:                                              │  │
+│  │  • SQLite with FTS5 for search                          │  │
+│  │  • Execution history and events                         │  │
+│  └────────────────────────────────────────────────────────┘  │
+│                            ↓                                  │
+│  ┌────────────────────────────────────────────────────────┐  │
+│  │        Python Executor (from qontinui-runner)           │  │
+│  │        • GUI automation (mouse, keyboard, vision)       │  │
+│  │        • Screenshot capture                             │  │
+│  │        • State detection                                │  │
+│  └────────────────────────────────────────────────────────┘  │
+└──────────────────────────────────────────────────────────────┘
 ```
-
-## Features
-
-### Desktop Runner
-- Execute Qontinui automation scripts
-- Visual feedback during execution
-- State visualization
-- Error handling and recovery
-- Screenshot capture and analysis
-
-### MCP Server
-- Expose Qontinui capabilities to AI agents
-- Tool definitions for automation actions
-- State management interface
-- Async execution support
 
 ## Installation
 
 ### Prerequisites
-- Rust 1.70+
-- Node.js 20+
-- Python 3.12+ (for MCP server)
+- Python 3.12+
+- Poetry
+- qontinui-runner (for the Python executor)
 
 ### Setup
 
 ```bash
-# Install dependencies
-npm install
-
-# Install Tauri CLI
-npm install -g @tauri-apps/cli
-
-# Install Rust dependencies
-cd src-tauri
-cargo build
-
-# Install Python dependencies for MCP
-cd ../mcp-server
-pip install -r requirements.txt
-```
-
-## Development
-
-### Run in development mode
-
-```bash
-# Start the desktop app
-npm run tauri dev
-
-# Start the MCP server (in another terminal)
 cd mcp-server
-python server.py
+
+# Install dependencies
+poetry install
+
+# Run the server
+poetry run qontinui-runner-mcp
 ```
 
-### Build for production
+## MCP Tools
 
-```bash
-npm run tauri build
-```
+### Knowledge Tools
+| Tool | Description |
+|------|-------------|
+| `search_nodes` | Search action nodes by natural language |
+| `search_workflows` | Search workflow templates |
+| `get_nodes_by_category` | Filter nodes by category |
+| `get_nodes_by_action_type` | Filter by action type |
+| `list_categories` | List all categories |
+| `get_action_details` | Get detailed node info |
 
-## MCP Integration
+### Workflow Tools
+| Tool | Description |
+|------|-------------|
+| `generate_workflow` | Generate from natural language |
+| `create_workflow` | Create from structured steps |
+| `validate_workflow` | Validate structure and connections |
 
-The MCP server exposes Qontinui tools for AI agents:
+### Execution Tools
+| Tool | Description |
+|------|-------------|
+| `run_automation` | Execute a workflow |
+| `start_executor` | Start the executor process |
+| `stop_executor` | Stop the executor |
+| `get_executor_status` | Check executor state |
+| `get_execution_events` | Get events from last run |
 
-```python
-# Example MCP tool usage
-tools = {
-    "capture_screenshot": capture_screenshot_tool,
-    "detect_state": detect_state_tool,
-    "execute_action": execute_action_tool,
-    "run_automation": run_automation_tool,
-}
-```
+### History Tools
+| Tool | Description |
+|------|-------------|
+| `list_executions` | List recent executions |
+| `get_execution` | Get execution details |
 
-### Connecting with Claude Desktop
+## Configuration
 
-Add to Claude Desktop config:
+### Claude Desktop
+
+Add to `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS) or `%APPDATA%\Claude\claude_desktop_config.json` (Windows):
 
 ```json
 {
   "mcpServers": {
     "qontinui": {
-      "command": "python",
-      "args": ["/path/to/qontinui-runner-mcp/mcp-server/server.py"],
-      "env": {}
+      "command": "poetry",
+      "args": ["run", "qontinui-runner-mcp"],
+      "cwd": "/path/to/qontinui-runner-mcp/mcp-server"
     }
   }
 }
 ```
 
-## API
+### Claude Code
 
-### Desktop Runner API
+Add to `.claude/settings.json`:
 
-```typescript
-// Execute automation script
-await invoke('execute_script', { script: dslScript });
-
-// Capture screenshot
-const screenshot = await invoke('capture_screenshot');
-
-// Get current state
-const state = await invoke('get_current_state');
-```
-
-### MCP Tools
-
-- `capture_screenshot`: Capture and analyze screen
-- `detect_state`: Detect current application state
-- `execute_action`: Execute a single automation action
-- `run_automation`: Run complete automation script
-- `get_elements`: Get UI elements from current screen
-
-## Configuration
-
-### tauri.conf.json
-
-Configure app settings, permissions, and build options.
-
-### MCP Server Config
-
-```python
-# mcp_config.py
-MCP_CONFIG = {
-    "server_name": "qontinui",
-    "version": "0.1.0",
-    "capabilities": ["screenshot", "automation", "state_detection"],
+```json
+{
+  "mcpServers": {
+    "qontinui": {
+      "command": "poetry",
+      "args": ["run", "qontinui-runner-mcp"],
+      "cwd": "/path/to/qontinui-runner-mcp/mcp-server"
+    }
+  }
 }
 ```
 
-## Testing
+## Example Usage
+
+```
+Claude: Use the search_nodes tool to find click actions.
+
+Claude: Generate a workflow to "click the login button and type username"
+
+Claude: Execute the workflow at /path/to/workflow.json
+
+Claude: Get the execution events from the last run.
+```
+
+## Development
 
 ```bash
-# Run frontend tests
-npm test
-
-# Run Rust tests
-cd src-tauri
-cargo test
-
-# Run MCP server tests
 cd mcp-server
-pytest
+
+# Install dev dependencies
+poetry install --with dev
+
+# Run linting
+poetry run black src/
+poetry run isort src/
+poetry run ruff src/
+poetry run mypy src/
 ```
 
-## Building
+## Database
 
-### Windows
-```bash
-npm run tauri build -- --target x86_64-pc-windows-msvc
-```
+The server uses SQLite with FTS5 for full-text search. Database is stored at:
+- `~/.qontinui/runner-mcp/qontinui.db`
 
-### macOS
-```bash
-npm run tauri build -- --target universal-apple-darwin
-```
-
-### Linux
-```bash
-npm run tauri build -- --target x86_64-unknown-linux-gnu
-```
+### Tables
+- `nodes` - Action node definitions
+- `workflows` - Workflow templates
+- `executions` - Execution history
+- `execution_events` - Detailed event logs
 
 ## License
 
-MIT License - see [LICENSE](LICENSE) file for details.
+MIT License
