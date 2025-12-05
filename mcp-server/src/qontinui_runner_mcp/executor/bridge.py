@@ -59,13 +59,20 @@ class ExecutorBridge:
         self.events: list[ExecutorEvent] = []
         self._reader_task: asyncio.Task[None] | None = None
         self._ready_event: asyncio.Event = asyncio.Event()
+        # Track loaded configuration
+        self.loaded_config_path: str | None = None
+        self.loaded_config: dict[str, Any] | None = None
 
     def _find_python_bridge(self) -> str:
         """Find the python-bridge directory."""
         possible_paths = [
+            # Relative to this file (mcp-server/src/.../executor/bridge.py)
+            # Goes up to qontinui_parent_directory, then into qontinui-runner
             Path(__file__).parent.parent.parent.parent.parent.parent.parent
             / "qontinui-runner"
             / "python-bridge",
+            # Direct path for qontinui_parent_directory layout
+            Path("/mnt/c/Users/Joshua/Documents/qontinui_parent_directory/qontinui-runner/python-bridge"),
             Path.home() / "qontinui" / "qontinui-runner" / "python-bridge",
             Path("/mnt/c/qontinui/qontinui-runner/python-bridge"),
         ]
@@ -307,13 +314,29 @@ class ExecutorBridge:
             logger.info("Received READY signal from executor")
             self._ready_event.set()
 
+        elif msg_type == "event":
+            # Handle event messages from minimal_bridge format: {"type": "event", "event": "ready", ...}
+            event_name = data.get("event", "")
+            if event_name == "ready":
+                logger.info("Received READY event from executor")
+                self._ready_event.set()
+            else:
+                # Process other events
+                event = ExecutorEvent.from_json(data)
+                self.events.append(event)
+                for handler in self.event_handlers:
+                    try:
+                        handler(event)
+                    except Exception as e:
+                        logger.error(f"Error in event handler: {e}")
+
         elif msg_type == "response":
             response = ExecutorResponse.from_json(data)
             pending = self.pending_commands.pop(response.id, None)
             if pending:
                 pending.future.set_result(response)
 
-        elif msg_type == "event" or msg_type == "tree_event":
+        elif msg_type == "tree_event":
             event = ExecutorEvent.from_json(data)
             self.events.append(event)
             for handler in self.event_handlers:
@@ -338,3 +361,143 @@ class ExecutorBridge:
     def remove_event_handler(self, handler: Callable[[ExecutorEvent], None]) -> None:
         """Remove an event handler."""
         self.event_handlers.remove(handler)
+
+    def is_config_loaded(self, config_path: str) -> bool:
+        """Check if a specific config file is currently loaded."""
+        if self.loaded_config_path is None:
+            return False
+        # Normalize paths for comparison
+        return Path(self.loaded_config_path).resolve() == Path(config_path).resolve()
+
+    def get_loaded_config_info(self) -> dict[str, Any]:
+        """Get information about the currently loaded config."""
+        if self.loaded_config_path is None:
+            return {
+                "loaded": False,
+                "config_path": None,
+                "workflows": [],
+            }
+
+        workflows = []
+        if self.loaded_config:
+            # Extract workflow names from the config
+            if "workflows" in self.loaded_config:
+                workflows = [
+                    {"name": w.get("name", f"workflow_{i}"), "id": w.get("id")}
+                    for i, w in enumerate(self.loaded_config.get("workflows", []))
+                ]
+            elif "name" in self.loaded_config:
+                # Single workflow config
+                workflows = [{"name": self.loaded_config.get("name"), "id": self.loaded_config.get("id")}]
+
+        return {
+            "loaded": True,
+            "config_path": self.loaded_config_path,
+            "workflows": workflows,
+        }
+
+    async def load_config(self, config_path: str) -> ExecutorResponse:
+        """Load a configuration file into the executor."""
+        # Ensure executor is running
+        if self.state != ExecutorState.READY:
+            await self.start()
+
+        # Load the config file to cache it
+        config_path_obj = Path(config_path)
+        if not config_path_obj.exists():
+            return ExecutorResponse(
+                id="",
+                success=False,
+                error=f"Config file not found: {config_path}",
+            )
+
+        try:
+            with open(config_path_obj) as f:
+                self.loaded_config = json.load(f)
+        except json.JSONDecodeError as e:
+            return ExecutorResponse(
+                id="",
+                success=False,
+                error=f"Invalid JSON in config file: {e}",
+            )
+
+        # Send load command to executor
+        response = await self.send_command(
+            "load",
+            {"config_path": str(config_path_obj.resolve())},
+        )
+
+        if response.success:
+            self.loaded_config_path = str(config_path_obj.resolve())
+        else:
+            self.loaded_config = None
+            self.loaded_config_path = None
+
+        return response
+
+    async def ensure_config_loaded(self, config_path: str) -> ExecutorResponse:
+        """Ensure a specific config is loaded, loading it if necessary."""
+        if self.is_config_loaded(config_path):
+            return ExecutorResponse(
+                id="",
+                success=True,
+                data={"already_loaded": True},
+            )
+
+        return await self.load_config(config_path)
+
+    async def run_workflow(
+        self,
+        workflow_name: str,
+        timeout: float = 300.0,
+    ) -> ExecutionResult:
+        """Run a specific workflow from the currently loaded config."""
+        execution_id = str(uuid.uuid4())
+        self.events = []
+        start_time = asyncio.get_event_loop().time()
+
+        if self.loaded_config is None:
+            return ExecutionResult(
+                execution_id=execution_id,
+                success=False,
+                error="No configuration loaded. Use load_config or ensure_config_loaded first.",
+            )
+
+        if self.state != ExecutorState.READY:
+            return ExecutionResult(
+                execution_id=execution_id,
+                success=False,
+                error=f"Executor not ready. Current state: {self.state.value}",
+            )
+
+        try:
+            self.state = ExecutorState.RUNNING
+
+            # Send start command with workflow name
+            start_response = await self.send_command(
+                "start",
+                {"mode": "execute", "workflow": workflow_name},
+                timeout=timeout,
+            )
+
+            duration_ms = int((asyncio.get_event_loop().time() - start_time) * 1000)
+
+            return ExecutionResult(
+                execution_id=execution_id,
+                success=start_response.success,
+                duration_ms=duration_ms,
+                events=list(self.events),
+                error=start_response.error,
+            )
+
+        except Exception as e:
+            duration_ms = int((asyncio.get_event_loop().time() - start_time) * 1000)
+            return ExecutionResult(
+                execution_id=execution_id,
+                success=False,
+                duration_ms=duration_ms,
+                events=list(self.events),
+                error=str(e),
+            )
+        finally:
+            self.state = ExecutorState.READY

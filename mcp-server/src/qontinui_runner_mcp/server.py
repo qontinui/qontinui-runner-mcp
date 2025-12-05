@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
+import shutil
 import sqlite3
 import uuid
 from datetime import datetime
@@ -27,7 +28,14 @@ from qontinui_runner_mcp.database.search import (
     search_workflows,
 )
 from qontinui_runner_mcp.executor.bridge import ExecutorBridge, ExecutorState
+from qontinui_runner_mcp.tools.expectations import (
+    evaluate_checkpoint,
+    evaluate_workflow_expectations,
+    validate_expectations_config,
+)
+from qontinui_runner_mcp.tools.ocr import extract_ocr_text, is_ocr_available
 from qontinui_runner_mcp.tools.workflow import WorkflowGenerator
+from qontinui_runner_mcp.types.models import CheckpointDefinition
 from qontinui_runner_mcp.utils.validation import validate_workflow_structure
 
 logging.basicConfig(level=logging.INFO)
@@ -35,6 +43,11 @@ logger = logging.getLogger(__name__)
 
 DB_DIR = Path.home() / ".qontinui" / "runner-mcp"
 DB_PATH = DB_DIR / "qontinui.db"
+
+# Automation results directory (for QA feedback loop)
+AUTOMATION_RESULTS_DIR = Path("/mnt/c/Users/Joshua/Documents/qontinui_parent_directory/.automation-results")
+DEV_LOGS_DIR = Path("/mnt/c/Users/Joshua/Documents/qontinui_parent_directory/.dev-logs")
+MAX_HISTORY_RUNS = 10
 
 server = Server("qontinui-runner-mcp")
 executor: ExecutorBridge | None = None
@@ -52,6 +65,87 @@ def get_executor() -> ExecutorBridge:
     if executor is None:
         executor = ExecutorBridge()
     return executor
+
+
+def get_workflow_expectations(workflow_config: dict[str, Any]) -> dict[str, Any] | None:
+    """Extract expectations from workflow config if present.
+
+    Args:
+        workflow_config: Full workflow configuration dict
+
+    Returns:
+        Expectations dict or None if not present
+    """
+    return workflow_config.get("expectations")
+
+
+def _build_execution_stats(events: list[Any]) -> dict[str, Any]:
+    """Build execution statistics from event list.
+
+    Args:
+        events: List of execution events
+
+    Returns:
+        Dictionary with execution statistics:
+        - total_actions: int
+        - successful_actions: int
+        - failed_actions: int
+        - skipped_actions: int
+        - match_count: int
+        - states_reached: set[str]
+        - checkpoints_passed: set[str]
+        - checkpoints_failed: set[str]
+    """
+    stats = {
+        "total_actions": 0,
+        "successful_actions": 0,
+        "failed_actions": 0,
+        "skipped_actions": 0,
+        "match_count": 0,
+        "states_reached": set(),
+        "checkpoints_passed": set(),
+        "checkpoints_failed": set(),
+    }
+
+    for event in events:
+        event_name = getattr(event, 'event', '')
+        event_data = getattr(event, 'data', {}) or {}
+
+        # Count actions
+        if event_name in ['action_started', 'action_completed']:
+            if event_name == 'action_started':
+                stats["total_actions"] += 1
+            elif event_name == 'action_completed':
+                if event_data.get('success'):
+                    stats["successful_actions"] += 1
+                else:
+                    stats["failed_actions"] += 1
+
+        # Count matches
+        if event_name == 'match_found':
+            stats["match_count"] += 1
+
+        # Track states
+        if event_name == 'state_changed':
+            new_state = event_data.get('state')
+            if new_state:
+                stats["states_reached"].add(new_state)
+
+        # Track checkpoints
+        if event_name == 'checkpoint_passed':
+            checkpoint = event_data.get('checkpoint_name')
+            if checkpoint:
+                stats["checkpoints_passed"].add(checkpoint)
+        elif event_name == 'checkpoint_failed':
+            checkpoint = event_data.get('checkpoint_name')
+            if checkpoint:
+                stats["checkpoints_failed"].add(checkpoint)
+
+        # Track skipped actions
+        if event_name == 'action_skipped':
+            stats["skipped_actions"] += 1
+
+    return stats
 
 
 @server.list_tools()
@@ -274,6 +368,118 @@ async def list_tools() -> list[Tool]:
                 "required": ["execution_id"],
             },
         ),
+        # Config Management Tools
+        Tool(
+            name="load_config",
+            description="Load a JSON configuration file into the executor. Use this before running workflows.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "config_path": {
+                        "type": "string",
+                        "description": "Absolute path to the JSON configuration file",
+                    },
+                },
+                "required": ["config_path"],
+            },
+        ),
+        Tool(
+            name="get_loaded_config",
+            description="Get information about the currently loaded configuration, including available workflows.",
+            inputSchema={"type": "object", "properties": {}},
+        ),
+        Tool(
+            name="ensure_config_loaded",
+            description="Ensure a specific config file is loaded. Loads it if not already loaded, skips if already loaded.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "config_path": {
+                        "type": "string",
+                        "description": "Absolute path to the JSON configuration file",
+                    },
+                },
+                "required": ["config_path"],
+            },
+        ),
+        Tool(
+            name="run_workflow",
+            description="Run a specific workflow by name from the currently loaded configuration.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "workflow_name": {
+                        "type": "string",
+                        "description": "Name of the workflow to run",
+                    },
+                    "timeout_seconds": {
+                        "type": "number",
+                        "description": "Maximum execution time in seconds (default: 300)",
+                        "default": 300,
+                    },
+                },
+                "required": ["workflow_name"],
+            },
+        ),
+        # Expectations Tools
+        Tool(
+            name="validate_expectations",
+            description="Validate the structure of an expectations configuration.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "expectations": {
+                        "type": "object",
+                        "description": "Expectations configuration to validate",
+                    },
+                },
+                "required": ["expectations"],
+            },
+        ),
+        Tool(
+            name="evaluate_expectations",
+            description="Evaluate workflow expectations against execution statistics.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "workflow_id": {
+                        "type": "string",
+                        "description": "Workflow identifier",
+                    },
+                    "expectations": {
+                        "type": "object",
+                        "description": "Expectations configuration",
+                    },
+                    "execution_stats": {
+                        "type": "object",
+                        "description": "Execution statistics (total_actions, failed_actions, etc.)",
+                    },
+                },
+                "required": ["workflow_id", "execution_stats"],
+            },
+        ),
+        Tool(
+            name="capture_and_evaluate_checkpoint",
+            description="Capture a screenshot, extract OCR text, and evaluate checkpoint assertions.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "checkpoint_name": {
+                        "type": "string",
+                        "description": "Name of the checkpoint",
+                    },
+                    "checkpoint_definition": {
+                        "type": "object",
+                        "description": "Checkpoint configuration with assertions",
+                    },
+                    "screenshot_path": {
+                        "type": "string",
+                        "description": "Path to screenshot file or base64 image data",
+                    },
+                },
+                "required": ["checkpoint_name", "checkpoint_definition", "screenshot_path"],
+            },
+        ),
     ]
     return tools
 
@@ -364,8 +570,19 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
             exec_bridge = get_executor()
             exec_result = await exec_bridge.execute_workflow(config_path, timeout)
 
+            # Save to database
             _save_execution(
                 conn,
+                exec_result.execution_id,
+                config_path,
+                exec_result.success,
+                exec_result.duration_ms,
+                exec_result.error,
+                exec_result.events,
+            )
+
+            # Save to filesystem for QA feedback loop
+            results_file = _save_automation_results(
                 exec_result.execution_id,
                 config_path,
                 exec_result.success,
@@ -380,6 +597,7 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
                 "duration_ms": exec_result.duration_ms,
                 "error": exec_result.error,
                 "event_count": len(exec_result.events),
+                "results_file": str(results_file),
             }
 
         elif name == "get_executor_status":
@@ -429,6 +647,176 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
             if not execution_id:
                 raise ValueError("execution_id parameter is required")
             result = _get_execution(conn, execution_id)
+
+        # Config Management Tools
+        elif name == "load_config":
+            config_path = arguments.get("config_path", "")
+            if not config_path:
+                raise ValueError("config_path parameter is required")
+
+            exec_bridge = get_executor()
+            load_response = await exec_bridge.load_config(config_path)
+
+            result = {
+                "success": load_response.success,
+                "config_path": config_path,
+                "error": load_response.error,
+                "config_info": exec_bridge.get_loaded_config_info() if load_response.success else None,
+            }
+
+        elif name == "get_loaded_config":
+            exec_bridge = get_executor()
+            result = exec_bridge.get_loaded_config_info()
+
+        elif name == "ensure_config_loaded":
+            config_path = arguments.get("config_path", "")
+            if not config_path:
+                raise ValueError("config_path parameter is required")
+
+            exec_bridge = get_executor()
+            load_response = await exec_bridge.ensure_config_loaded(config_path)
+
+            already_loaded = load_response.data.get("already_loaded", False) if load_response.data else False
+            result = {
+                "success": load_response.success,
+                "config_path": config_path,
+                "already_loaded": already_loaded,
+                "error": load_response.error,
+                "config_info": exec_bridge.get_loaded_config_info(),
+            }
+
+        elif name == "run_workflow":
+            workflow_name = arguments.get("workflow_name", "")
+            timeout = arguments.get("timeout_seconds", 300)
+            if not workflow_name:
+                raise ValueError("workflow_name parameter is required")
+
+            exec_bridge = get_executor()
+
+            # Check if a config is loaded
+            if exec_bridge.loaded_config is None:
+                result = {
+                    "success": False,
+                    "error": "No configuration loaded. Use load_config or ensure_config_loaded first.",
+                }
+            else:
+                exec_result = await exec_bridge.run_workflow(workflow_name, timeout)
+                config_path = exec_bridge.loaded_config_path or "unknown"
+
+                # Save execution to database
+                _save_execution(
+                    conn,
+                    exec_result.execution_id,
+                    config_path,
+                    exec_result.success,
+                    exec_result.duration_ms,
+                    exec_result.error,
+                    exec_result.events,
+                )
+
+                # Save to filesystem for QA feedback loop
+                results_file = _save_automation_results(
+                    exec_result.execution_id,
+                    config_path,
+                    exec_result.success,
+                    exec_result.duration_ms,
+                    exec_result.error,
+                    exec_result.events,
+                    workflow_name=workflow_name,
+                )
+
+                # Extract and evaluate expectations if present
+                expectations_result = None
+                if exec_bridge.loaded_config:
+                    expectations = get_workflow_expectations(exec_bridge.loaded_config)
+                    if expectations:
+                        # Build execution stats from events
+                        execution_stats = _build_execution_stats(exec_result.events)
+
+                        # Evaluate expectations
+                        eval_result = evaluate_workflow_expectations(
+                            workflow_id=workflow_name,
+                            expectations=expectations,
+                            execution_stats=execution_stats,
+                        )
+                        expectations_result = eval_result.model_dump()
+
+                result = {
+                    "execution_id": exec_result.execution_id,
+                    "workflow_name": workflow_name,
+                    "success": exec_result.success,
+                    "duration_ms": exec_result.duration_ms,
+                    "error": exec_result.error,
+                    "event_count": len(exec_result.events),
+                    "results_file": str(results_file),
+                    "expectations_result": expectations_result,
+                }
+
+        # Expectations Tools
+        elif name == "validate_expectations":
+            expectations = arguments.get("expectations")
+            if not expectations:
+                raise ValueError("expectations parameter is required")
+
+            is_valid, errors = validate_expectations_config(expectations)
+            result = {
+                "valid": is_valid,
+                "errors": errors,
+            }
+
+        elif name == "evaluate_expectations":
+            workflow_id = arguments.get("workflow_id", "")
+            expectations = arguments.get("expectations")
+            execution_stats = arguments.get("execution_stats", {})
+
+            if not workflow_id:
+                raise ValueError("workflow_id parameter is required")
+            if not execution_stats:
+                raise ValueError("execution_stats parameter is required")
+
+            eval_result = evaluate_workflow_expectations(
+                workflow_id=workflow_id,
+                expectations=expectations,
+                execution_stats=execution_stats,
+            )
+            result = eval_result.model_dump()
+
+        elif name == "capture_and_evaluate_checkpoint":
+            checkpoint_name = arguments.get("checkpoint_name", "")
+            checkpoint_definition = arguments.get("checkpoint_definition")
+            screenshot_path = arguments.get("screenshot_path", "")
+
+            if not checkpoint_name:
+                raise ValueError("checkpoint_name parameter is required")
+            if not checkpoint_definition:
+                raise ValueError("checkpoint_definition parameter is required")
+            if not screenshot_path:
+                raise ValueError("screenshot_path parameter is required")
+
+            # Parse checkpoint definition
+            try:
+                checkpoint_def = CheckpointDefinition.model_validate(checkpoint_definition)
+            except Exception as e:
+                result = {
+                    "success": False,
+                    "error": f"Invalid checkpoint definition: {e}",
+                }
+            else:
+                # Extract OCR text if OCR is available and assertions are present
+                ocr_text = None
+                if checkpoint_def.ocr_assertions and is_ocr_available():
+                    ocr_text = extract_ocr_text(screenshot_path)
+                    if ocr_text is None:
+                        logger.warning("OCR extraction failed for checkpoint")
+
+                # Evaluate checkpoint
+                checkpoint_result = evaluate_checkpoint(
+                    checkpoint_name=checkpoint_name,
+                    checkpoint_def=checkpoint_def,
+                    screenshot_path=screenshot_path,
+                    ocr_text=ocr_text,
+                )
+                result = checkpoint_result.model_dump()
 
         else:
             raise ValueError(f"Unknown tool: {name}")
@@ -567,6 +955,168 @@ def _get_execution(
             for e in event_rows
         ],
     }
+
+
+def _save_automation_results(
+    execution_id: str,
+    config_path: str,
+    success: bool,
+    duration_ms: int,
+    error: str | None,
+    events: list[Any],
+    workflow_name: str | None = None,
+) -> Path:
+    """Save automation results to filesystem for QA feedback loop.
+
+    This saves results to .automation-results/latest/ and archives to history/.
+    Log snapshots are captured from .dev-logs/ at execution time.
+    """
+    # Ensure directories exist
+    latest_dir = AUTOMATION_RESULTS_DIR / "latest"
+    history_dir = AUTOMATION_RESULTS_DIR / "history"
+    latest_logs_dir = latest_dir / "logs"
+    latest_screenshots_dir = latest_dir / "screenshots"
+
+    for d in [latest_dir, history_dir, latest_logs_dir, latest_screenshots_dir]:
+        d.mkdir(parents=True, exist_ok=True)
+
+    # Archive previous latest to history (if exists)
+    existing_execution_file = latest_dir / "execution.json"
+    if existing_execution_file.exists():
+        try:
+            with open(existing_execution_file) as f:
+                prev_data = json.load(f)
+                prev_id = prev_data.get("execution_id", "unknown")
+                prev_timestamp = prev_data.get("timestamp", "unknown").replace(":", "-").replace(".", "-")
+
+            # Create history entry
+            history_entry_name = f"{prev_timestamp}_{prev_id[:8]}"
+            history_entry_dir = history_dir / history_entry_name
+
+            # Move latest to history
+            if not history_entry_dir.exists():
+                shutil.copytree(latest_dir, history_entry_dir)
+                logger.info(f"Archived previous run to history: {history_entry_name}")
+
+            # Clean up old history entries
+            _cleanup_history(history_dir)
+        except Exception as e:
+            logger.warning(f"Failed to archive previous results: {e}")
+
+    # Clear latest directory
+    for item in latest_dir.iterdir():
+        if item.is_file():
+            item.unlink()
+        elif item.is_dir():
+            shutil.rmtree(item)
+
+    # Recreate subdirectories
+    latest_logs_dir.mkdir(exist_ok=True)
+    latest_screenshots_dir.mkdir(exist_ok=True)
+
+    # Capture log snapshots from .dev-logs
+    log_files = ["backend.log", "frontend.log", "qontinui-api.log", "runner.log"]
+    for log_file in log_files:
+        src_log = DEV_LOGS_DIR / log_file
+        if src_log.exists():
+            try:
+                # Copy last 500 lines of each log (truncate for efficiency)
+                with open(src_log, "r", errors="ignore") as f:
+                    lines = f.readlines()
+                    last_lines = lines[-500:] if len(lines) > 500 else lines
+
+                dst_log = latest_logs_dir / log_file
+                with open(dst_log, "w") as f:
+                    f.writelines(last_lines)
+
+                logger.info(f"Captured log snapshot: {log_file} ({len(last_lines)} lines)")
+            except Exception as e:
+                logger.warning(f"Failed to capture log {log_file}: {e}")
+
+    # Build execution results JSON
+    timestamp = datetime.now().isoformat()
+
+    # Extract test results from events
+    test_results = []
+    console_errors = []
+    network_failures = []
+    screenshots = []
+
+    for event in events:
+        event_name = getattr(event, 'event', '')
+        event_data = getattr(event, 'data', {}) or {}
+
+        # Capture test-related events
+        if event_name in ['test_passed', 'test_failed', 'assertion_passed', 'assertion_failed']:
+            test_results.append({
+                "event": event_name,
+                "data": event_data,
+                "timestamp": getattr(event, 'timestamp', ''),
+            })
+
+        # Capture console errors
+        if event_name == 'console_error' or (event_name == 'browser_event' and event_data.get('type') == 'error'):
+            console_errors.append(event_data)
+
+        # Capture network failures
+        if event_name == 'network_failure' or (event_name == 'network_event' and event_data.get('status', 200) >= 400):
+            network_failures.append(event_data)
+
+        # Capture screenshots
+        if event_name == 'screenshot' and event_data.get('path'):
+            screenshots.append(event_data.get('path'))
+
+    execution_result = {
+        "execution_id": execution_id,
+        "config_path": config_path,
+        "workflow_name": workflow_name or Path(config_path).stem,
+        "success": success,
+        "duration_ms": duration_ms,
+        "timestamp": timestamp,
+        "error": error,
+        "summary": {
+            "total_events": len(events),
+            "test_results_count": len(test_results),
+            "console_errors_count": len(console_errors),
+            "network_failures_count": len(network_failures),
+        },
+        "test_results": test_results,
+        "console_errors": console_errors,
+        "network_failures": network_failures,
+        "screenshots": screenshots,
+        "log_snapshots": {
+            "backend": str(latest_logs_dir / "backend.log") if (latest_logs_dir / "backend.log").exists() else None,
+            "frontend": str(latest_logs_dir / "frontend.log") if (latest_logs_dir / "frontend.log").exists() else None,
+            "api": str(latest_logs_dir / "qontinui-api.log") if (latest_logs_dir / "qontinui-api.log").exists() else None,
+            "runner": str(latest_logs_dir / "runner.log") if (latest_logs_dir / "runner.log").exists() else None,
+        },
+    }
+
+    # Write execution.json
+    execution_file = latest_dir / "execution.json"
+    with open(execution_file, "w") as f:
+        json.dump(execution_result, f, indent=2)
+
+    logger.info(f"Saved automation results to {execution_file}")
+
+    return execution_file
+
+
+def _cleanup_history(history_dir: Path) -> None:
+    """Keep only the most recent MAX_HISTORY_RUNS in history."""
+    entries = sorted(
+        [d for d in history_dir.iterdir() if d.is_dir()],
+        key=lambda x: x.stat().st_mtime,
+        reverse=True,
+    )
+
+    # Remove old entries
+    for old_entry in entries[MAX_HISTORY_RUNS:]:
+        try:
+            shutil.rmtree(old_entry)
+            logger.info(f"Removed old history entry: {old_entry.name}")
+        except Exception as e:
+            logger.warning(f"Failed to remove old history entry {old_entry.name}: {e}")
 
 
 async def run_server() -> None:

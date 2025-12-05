@@ -1,5 +1,17 @@
 """Type definitions for Qontinui nodes, actions, and workflows."""
 
+from qontinui_runner_mcp.types.expectations import (
+    ActionExpectations,
+    CheckpointDefinition,
+    CheckpointResult,
+    ExpectationsEvaluationResult,
+    GlobalExpectations,
+    OCRAssertion,
+    OCRAssertionType,
+    SuccessCriterion,
+    SuccessCriteriaType,
+    WorkflowExpectations,
+)
 from qontinui_runner_mcp.types.models import (
     ActionConfig,
     ActionResult,
@@ -24,6 +36,7 @@ from qontinui_runner_mcp.types.models import (
 )
 
 __all__ = [
+    # Base types
     "ActionType",
     "Region",
     "Location",
@@ -44,4 +57,15 @@ __all__ = [
     "StepResult",
     "WorkflowTemplate",
     "WorkflowSearchResult",
+    # Expectations types
+    "SuccessCriteriaType",
+    "SuccessCriterion",
+    "OCRAssertionType",
+    "OCRAssertion",
+    "CheckpointDefinition",
+    "GlobalExpectations",
+    "WorkflowExpectations",
+    "ActionExpectations",
+    "CheckpointResult",
+    "ExpectationsEvaluationResult",
 ]
